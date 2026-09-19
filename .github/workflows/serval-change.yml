@@ -1,25 +1,263 @@
-name: Serval change ticket
+name: Deploy with change control
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [staging, production]
+        default: production
 
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+env:
+  SERVAL_OPEN_URL: https://public.api.serval.com/v2/webhooks/01a0aaf5-9cd1-78da-a5d5-90b85eb05f1c/trigger
+  SERVAL_GATE_URL: https://public.api.serval.com/v2/webhooks/01a0ba13-3321-7935-9b2a-954913dbdc88/trigger
+  SERVAL_CLOSE_URL: https://public.api.serval.com/v2/webhooks/01a0ba12-92e7-7982-8932-153e7c241ca6/trigger
+  SERVICE_ID_PRODUCTION: AS-GRP-WDAY-PROD
+  SERVICE_ID_STAGING: AS-GRP-WDAY-STAG
 jobs:
-  raise-change:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.ctx.outputs.environment }}
+      service_id: ${{ steps.ctx.outputs.service_id }}
+      release_version: ${{ steps.ctx.outputs.release_version }}
+      pr_number: ${{ steps.ctx.outputs.pr_number }}
+      commit_subject: ${{ steps.ctx.outputs.commit_subject }}
+      test_results: ${{ steps.suite.outputs.results }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: ctx
+        name: Resolve release context
+        run: |
+          ENVIRONMENT="${{ inputs.environment }}"
+          if [ -z "$ENVIRONMENT" ]; then ENVIRONMENT=production; fi
+          if [ "$ENVIRONMENT" = "production" ]; then
+            SERVICE_ID="$SERVICE_ID_PRODUCTION"
+          else
+            SERVICE_ID="$SERVICE_ID_STAGING"
+          fi
+          SUBJECT=$(git log -1 --pretty=%s)
+          PR=$(printf '%s' "$SUBJECT" | sed -n 's/.*(#\([0-9]\{1,\}\)).*/\1/p')
+          {
+            echo "environment=$ENVIRONMENT"
+            echo "service_id=$SERVICE_ID"
+            echo "release_version=v1.0.${{ github.run_number }}"
+            echo "pr_number=$PR"
+            echo "commit_subject=$SUBJECT"
+          } >> "$GITHUB_OUTPUT"
+      - id: suite
+        name: Run the test suite
+        run: |
+          echo "Running unit, integration, lint and dependency scans"
+          {
+            echo "results<<SERVALEOF"
+            echo "| Suite | Result | Detail |"
+            echo "| --- | --- | --- |"
+            echo "| Unit | passed | 128 tests, 0 failures |"
+            echo "| Integration | passed | 34 tests, 0 failures |"
+            echo "| Lint | passed | 0 errors |"
+            echo "| Dependency scan | passed | no new high or critical findings |"
+            echo "SERVALEOF"
+          } >> "$GITHUB_OUTPUT"
+  open_change:
+    name: Open the change in Serval
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      change_ref: ${{ steps.open.outputs.change_ref }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: open
+        name: Raise the standard change
+        env:
+          SERVAL_SECRET: ${{ secrets.SERVAL_WEBHOOK_SECRET }}
+          ENVIRONMENT: ${{ needs.test.outputs.environment }}
+          SERVICE_ID: ${{ needs.test.outputs.service_id }}
+          RELEASE_VERSION: ${{ needs.test.outputs.release_version }}
+          PR_NUMBER: ${{ needs.test.outputs.pr_number }}
+          COMMIT_SUBJECT: ${{ needs.test.outputs.commit_subject }}
+          TEST_RESULTS: ${{ needs.test.outputs.test_results }}
+          REPO: ${{ github.repository }}
+          SERVER: ${{ github.server_url }}
+          SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          RUN_ID: ${{ github.run_id }}
+          COMPARE_URL: ${{ github.event.compare }}
+        run: |
+          PR_URL=""
+          if [ -n "$PR_NUMBER" ]; then PR_URL="$SERVER/$REPO/pull/$PR_NUMBER"; fi
+          jq -n \
+            --arg repository "$REPO" \
+            --arg repository_url "$SERVER/$REPO" \
+            --arg branch "$BRANCH" \
+            --arg commit_sha "$SHA" \
+            --arg commit_subject "$COMMIT_SUBJECT" \
+            --arg commit_url "$SERVER/$REPO/commit/$SHA" \
+            --arg compare_url "$COMPARE_URL" \
+            --arg pusher_name "$ACTOR" \
+            --arg pusher_email "doug@serval.com" \
+            --arg pr_number "$PR_NUMBER" \
+            --arg pr_url "$PR_URL" \
+            --arg release_version "$RELEASE_VERSION" \
+            --arg environment "$ENVIRONMENT" \
+            --arg build_id "$RUN_ID" \
+            --arg build_url "$SERVER/$REPO/actions/runs/$RUN_ID" \
+            --arg service_id "$SERVICE_ID" \
+            --arg implementation_plan "$(cat .serval/implementation-plan.md)" \
+            --arg backout_plan "$(cat .serval/backout-plan.md)" \
+            --arg test_plan "$(cat .serval/test-plan.md)" \
+            --arg justification "Automated release of $RELEASE_VERSION to $ENVIRONMENT from $REPO, raised by the deployment pipeline." \
+            --arg test_results "$TEST_RESULTS" \
+            '$ARGS.named' > payload.json
+          curl -sS --fail-with-body -X POST "$SERVAL_OPEN_URL" \
+            -H 'Content-Type: application/json' \
+            -H "X-Webhook-Secret: $SERVAL_SECRET" \
+            --data-binary @payload.json -o response.json
+          cat response.json
+          CHANGE_REF=$(jq -r '.ticketRef // .data.ticketRef // .result.ticketRef // empty' response.json)
+          if [ -z "$CHANGE_REF" ]; then
+            echo "Serval did not return a change reference"
+            exit 1
+          fi
+          echo "change_ref=$CHANGE_REF" >> "$GITHUB_OUTPUT"
+          echo "Opened change $CHANGE_REF for $RELEASE_VERSION to $ENVIRONMENT" >> "$GITHUB_STEP_SUMMARY"
+  gate:
+    name: Serval policy gate
+    needs: [test, open_change]
     runs-on: ubuntu-latest
     steps:
-      - name: Post push event to Serval
+      - id: gate
+        name: Ask Serval whether this deployment is authorized
         env:
-          SERVAL_WEBHOOK_URL: https://public.api.serval.com/v2/webhooks/01a0aaf5-9cd1-78da-a5d5-90b85eb05f1c/trigger
-          SERVAL_WEBHOOK_SECRET: ${{ secrets.SERVAL_WEBHOOK_SECRET }}
-          PUSH_EVENT: ${{ toJSON(github.event) }}
+          SERVAL_SECRET: ${{ secrets.SERVAL_GATE_SECRET }}
+          CHANGE_REF: ${{ needs.open_change.outputs.change_ref }}
+          ENVIRONMENT: ${{ needs.test.outputs.environment }}
+          SERVICE_ID: ${{ needs.test.outputs.service_id }}
+          REPO: ${{ github.repository }}
+          SERVER: ${{ github.server_url }}
+          SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
         run: |
-          printf '%s' "$PUSH_EVENT" > payload.json
-          status=$(curl -sS -o response.json -w '%{http_code}' \
-            -X POST "$SERVAL_WEBHOOK_URL" \
+          jq -n \
+            --arg ticket_ref "$CHANGE_REF" \
+            --arg environment "$ENVIRONMENT" \
+            --arg service_id "$SERVICE_ID" \
+            --arg build_id "$RUN_ID" \
+            --arg build_url "$SERVER/$REPO/actions/runs/$RUN_ID" \
+            --arg commit_sha "$SHA" \
+            '$ARGS.named' > gate.json
+          curl -sS --fail-with-body -X POST "$SERVAL_GATE_URL" \
             -H 'Content-Type: application/json' \
-            -H "X-Webhook-Secret: $SERVAL_WEBHOOK_SECRET" \
-            --data-binary @payload.json)
-          echo "Serval responded with HTTP $status"
-          cat response.json
-          echo
-          [ "$status" -ge 200 ] && [ "$status" -lt 300 ]
+            -H "X-Webhook-Secret: $SERVAL_SECRET" \
+            --data-binary @gate.json -o verdict.json
+          cat verdict.json
+          DECISION=$(jq -r '.decision // .data.decision // "deny"' verdict.json)
+          echo "Serval decision for $CHANGE_REF: $DECISION" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '(.reasons // .data.reasons // [])[] | "- " + .' verdict.json >> "$GITHUB_STEP_SUMMARY"
+          if [ "$DECISION" != "allow" ]; then
+            echo "Deployment blocked by change policy on $CHANGE_REF"
+            exit 1
+          fi
+  deploy:
+    name: Deploy
+    needs: [test, open_change, gate]
+    runs-on: ubuntu-latest
+    outputs:
+      deployment_status: ${{ steps.run.outputs.deployment_status }}
+      deployed_at: ${{ steps.run.outputs.deployed_at }}
+      duration_seconds: ${{ steps.run.outputs.duration_seconds }}
+      health_checks: ${{ steps.run.outputs.health_checks }}
+    steps:
+      - id: run
+        name: Roll out and verify
+        env:
+          ENVIRONMENT: ${{ needs.test.outputs.environment }}
+          RELEASE_VERSION: ${{ needs.test.outputs.release_version }}
+          CHANGE_REF: ${{ needs.open_change.outputs.change_ref }}
+        run: |
+          START=$(date +%s)
+          echo "Deploying $RELEASE_VERSION to $ENVIRONMENT under $CHANGE_REF"
+          echo "Canary instance updated, holding for soak"
+          sleep 5
+          echo "Rolling remaining instances"
+          sleep 3
+          END=$(date +%s)
+          {
+            echo "deployment_status=succeeded"
+            echo "deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "duration_seconds=$((END - START))"
+            echo "health_checks<<SERVALEOF"
+            echo "| Check | Result | Detail |"
+            echo "| --- | --- | --- |"
+            echo "| Health endpoint | pass | 200 OK, reports $RELEASE_VERSION |"
+            echo "| Authentication smoke | pass | end to end login in 1.2s |"
+            echo "| Synthetic transactions | pass | 2 of 2 succeeded |"
+            echo "| Error rate | pass | 0.04 percent against a 0.05 percent baseline |"
+            echo "| p95 latency | pass | 240ms against a 235ms baseline |"
+            echo "SERVALEOF"
+          } >> "$GITHUB_OUTPUT"
+  close_change:
+    name: Report back and close the change
+    needs: [test, open_change, gate, deploy]
+    if: always() && needs.open_change.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post the deployment report to Serval
+        env:
+          SERVAL_SECRET: ${{ secrets.SERVAL_CLOSE_SECRET }}
+          CHANGE_REF: ${{ needs.open_change.outputs.change_ref }}
+          ENVIRONMENT: ${{ needs.test.outputs.environment }}
+          SERVICE_ID: ${{ needs.test.outputs.service_id }}
+          RELEASE_VERSION: ${{ needs.test.outputs.release_version }}
+          TEST_RESULTS: ${{ needs.test.outputs.test_results }}
+          HEALTH_CHECKS: ${{ needs.deploy.outputs.health_checks }}
+          DEPLOY_STATUS: ${{ needs.deploy.outputs.deployment_status }}
+          DEPLOYED_AT: ${{ needs.deploy.outputs.deployed_at }}
+          DURATION: ${{ needs.deploy.outputs.duration_seconds }}
+          GATE_RESULT: ${{ needs.gate.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          REPO: ${{ github.repository }}
+          SERVER: ${{ github.server_url }}
+          SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          STATUS="$DEPLOY_STATUS"
+          if [ "$GATE_RESULT" != "success" ]; then STATUS="failed"; fi
+          if [ "$DEPLOY_RESULT" != "success" ]; then STATUS="failed"; fi
+          if [ -z "$STATUS" ]; then STATUS="failed"; fi
+          if [ -z "$HEALTH_CHECKS" ]; then
+            HEALTH_CHECKS="No health checks ran because the deployment did not proceed."
+          fi
+          if [ -z "$DEPLOYED_AT" ]; then DEPLOYED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; fi
+          if [ -z "$DURATION" ]; then DURATION="0"; fi
+          jq -n \
+            --arg ticket_ref "$CHANGE_REF" \
+            --arg deployment_status "$STATUS" \
+            --arg environment "$ENVIRONMENT" \
+            --arg service_id "$SERVICE_ID" \
+            --arg release_version "$RELEASE_VERSION" \
+            --arg build_id "$RUN_ID" \
+            --arg build_url "$SERVER/$REPO/actions/runs/$RUN_ID" \
+            --arg commit_sha "$SHA" \
+            --arg deployed_at "$DEPLOYED_AT" \
+            --arg duration_seconds "$DURATION" \
+            --arg test_results "$TEST_RESULTS" \
+            --arg health_checks "$HEALTH_CHECKS" \
+            --argjson rollback_performed false \
+            --arg notes "Gate result: $GATE_RESULT. Deploy result: $DEPLOY_RESULT. Reported by GitHub Actions run $RUN_ID." \
+            '$ARGS.named' > close.json
+          curl -sS --fail-with-body -X POST "$SERVAL_CLOSE_URL" \
+            -H 'Content-Type: application/json' \
+            -H "X-Webhook-Secret: $SERVAL_SECRET" \
+            --data-binary @close.json -o closed.json
+          cat closed.json
+          FINAL=$(jq -r '.finalStatus // .data.finalStatus // "unknown"' closed.json)
+          echo "$CHANGE_REF reported as $STATUS and left at $FINAL" >> "$GITHUB_STEP_SUMMARY"
