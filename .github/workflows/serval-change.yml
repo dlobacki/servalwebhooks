@@ -159,9 +159,9 @@ jobs:
             -H "X-Webhook-Secret: $SERVAL_SECRET" \
             --data-binary @gate.json -o verdict.json
           cat verdict.json
-          DECISION=$(jq -r '.decision // .data.decision // "deny"' verdict.json)
+          DECISION=$(jq -r '.result.decision // .decision // .data.decision // "deny"' verdict.json)
           echo "Serval decision for $CHANGE_REF: $DECISION" >> "$GITHUB_STEP_SUMMARY"
-          jq -r '(.reasons // .data.reasons // [])[] | "- " + .' verdict.json >> "$GITHUB_STEP_SUMMARY"
+          jq -r '((.result.reasons // .reasons // .data.reasons) // [])[] | "- " + .' verdict.json >> "$GITHUB_STEP_SUMMARY"
           if [ "$DECISION" != "allow" ]; then
             echo "Deployment blocked by change policy on $CHANGE_REF"
             exit 1
@@ -259,5 +259,5 @@ jobs:
             -H "X-Webhook-Secret: $SERVAL_SECRET" \
             --data-binary @close.json -o closed.json
           cat closed.json
-          FINAL=$(jq -r '.finalStatus // .data.finalStatus // "unknown"' closed.json)
+          FINAL=$(jq -r '.result.finalStatus // .finalStatus // .data.finalStatus // "unknown"' closed.json)
           echo "$CHANGE_REF reported as $STATUS and left at $FINAL" >> "$GITHUB_STEP_SUMMARY"
