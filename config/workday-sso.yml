@@ -1,5 +1,5 @@
 yaml
 # Workday HCM single sign-on
-session_timeout_hours: 12   # was 4
+session_timeout_hours: 8   # was 4
 idle_logout_minutes: 30
 enforce_mfa: true 
