@@ -207,7 +207,7 @@ jobs:
   close_change:
     name: Report back and close the change
     needs: [test, open_change, gate, deploy]
-    if: always() && needs.open_change.result == 'success'
+    if: always() && needs.open_change.result == 'success' && needs.gate.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Post the deployment report to Serval
