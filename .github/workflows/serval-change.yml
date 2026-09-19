@@ -1,0 +1,25 @@
+name: Serval change ticket
+on:
+  push:
+    branches: [main]
+
+jobs:
+  raise-change:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post push event to Serval
+        env:
+          SERVAL_WEBHOOK_URL: https://public.api.serval.com/v2/webhooks/01a0aaf5-9cd1-78da-a5d5-90b85eb05f1c/trigger
+          SERVAL_WEBHOOK_SECRET: ${{ secrets.SERVAL_WEBHOOK_SECRET }}
+          PUSH_EVENT: ${{ toJSON(github.event) }}
+        run: |
+          printf '%s' "$PUSH_EVENT" > payload.json
+          status=$(curl -sS -o response.json -w '%{http_code}' \
+            -X POST "$SERVAL_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -H "X-Webhook-Secret: $SERVAL_WEBHOOK_SECRET" \
+            --data-binary @payload.json)
+          echo "Serval responded with HTTP $status"
+          cat response.json
+          echo
+          [ "$status" -ge 200 ] && [ "$status" -lt 300 ]
